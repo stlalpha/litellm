@@ -377,6 +377,10 @@ class Router:
 
         self.set_verbose = set_verbose
         self.ignore_invalid_deployments = ignore_invalid_deployments
+        if max_router_chain_depth < 1:
+            raise ValueError(
+                f"max_router_chain_depth must be >= 1, got {max_router_chain_depth}"
+            )
         self.max_router_chain_depth = max_router_chain_depth
         self.debug_level = debug_level
         self.enable_pre_call_checks = enable_pre_call_checks
@@ -6809,9 +6813,11 @@ class Router:
         return False
 
     def set_model_list(self, model_list: list):
-        # Keep a pristine copy for startup validation (original_model_list is
-        # mutated by the .pop() calls in the loop below).
+        # Validate chains on the candidate list BEFORE mutating any internal
+        # state so that a validation failure leaves the router unchanged.
         _model_list_for_validation = copy.deepcopy(model_list)
+        detect_circular_chains(_model_list_for_validation)
+
         original_model_list = copy.deepcopy(model_list)
         self.model_list = []
         self.model_id_to_deployment_index_map = {}  # Reset the index
@@ -6862,9 +6868,6 @@ class Router:
 
         # Note: model_name_to_deployment_indices is already built incrementally
         # by _create_deployment -> _add_model_to_list_and_index_map
-
-        # Validate that no circular router chains exist before requests start.
-        detect_circular_chains(_model_list_for_validation)
 
     def _add_deployment(self, deployment: Deployment) -> Deployment:
         import os
@@ -9454,6 +9457,24 @@ class Router:
             )
 
         final_model = routing_chain[-1]
+
+        # If the depth guard left us on a virtual router, walk the chain
+        # backwards to find the last concrete (non-virtual) model.
+        if self._is_virtual_router(final_model):
+            concrete_model = None
+            for candidate in reversed(routing_chain):
+                if not self._is_virtual_router(candidate):
+                    concrete_model = candidate
+                    break
+            if concrete_model is None:
+                raise ValueError(
+                    f"Router chain for '{model}' resolved only to virtual routers "
+                    f"after hitting the depth limit ({self.max_router_chain_depth}). "
+                    f"Chain: {' → '.join(routing_chain)}. "
+                    "No concrete deployment found to route to."
+                )
+            final_model = concrete_model
+
         total_latency = sum(layer.latency_ms for layer in routing_layers)
 
         result = PreRoutingHookResponse(
