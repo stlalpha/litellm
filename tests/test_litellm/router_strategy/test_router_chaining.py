@@ -12,7 +12,7 @@ Covers:
 """
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -49,7 +49,9 @@ def _make_router_with_hooks(
     # Bind the real methods to the mock instance so they execute normally
     router._is_virtual_router = Router._is_virtual_router.__get__(router, Router)
     router._invoke_single_router = Router._invoke_single_router.__get__(router, Router)
-    router.async_pre_routing_hook = Router.async_pre_routing_hook.__get__(router, Router)
+    router.async_pre_routing_hook = Router.async_pre_routing_hook.__get__(
+        router, Router
+    )
     return router
 
 
@@ -210,7 +212,9 @@ class TestPreRoutingHookResponse:
 
     def test_routing_chain_field_populated(self):
         layers = [
-            RoutingLayerInfo(layer=1, router_type="semantic", route="code", latency_ms=42.1)
+            RoutingLayerInfo(
+                layer=1, router_type="semantic", route="code", latency_ms=42.1
+            )
         ]
         r = PreRoutingHookResponse(
             model="sonnet",
@@ -247,7 +251,9 @@ class TestAsyncPreRoutingHookChaining:
             return_value=_make_pre_routing_response("gpt-4o-mini")
         )
 
-        router = _make_router_with_hooks(complexity_routers={"cheap-router": complexity_mock})
+        router = _make_router_with_hooks(
+            complexity_routers={"cheap-router": complexity_mock}
+        )
         request_kwargs: Dict[str, Any] = {}
         result = await router.async_pre_routing_hook(
             model="cheap-router",
@@ -280,7 +286,9 @@ class TestAsyncPreRoutingHookChaining:
             complexity_routers={"code-complexity": complexity_mock},
         )
         request_kwargs: Dict[str, Any] = {}
-        messages = [{"role": "user", "content": "write a python function to sort a list"}]
+        messages = [
+            {"role": "user", "content": "write a python function to sort a list"}
+        ]
         result = await router.async_pre_routing_hook(
             model="auto",
             request_kwargs=request_kwargs,
@@ -317,7 +325,9 @@ class TestAsyncPreRoutingHookChaining:
         result = await router.async_pre_routing_hook(
             model="entry",
             request_kwargs={},
-            messages=[{"role": "user", "content": "analyze this architecture step by step"}],
+            messages=[
+                {"role": "user", "content": "analyze this architecture step by step"}
+            ],
         )
         assert result is not None
         assert result.model == "opus"
@@ -351,15 +361,23 @@ class TestAsyncPreRoutingHookChaining:
         assert result is not None
         assert result.model == "concrete-model"
         assert result.routing_chain == [
-            "router-a", "router-b", "router-c", "concrete-model"
+            "router-a",
+            "router-b",
+            "router-c",
+            "concrete-model",
         ]
         assert len(result.routing_layers) == 3
 
     async def test_max_depth_guard_stops_chain(self):
         """When max_depth is exceeded the hook returns the last resolved model
         and logs a warning, without raising an exception."""
-        async def cycling_hook(model, request_kwargs, messages, input, specific_deployment):
-            return _make_pre_routing_response("router-b" if model == "router-a" else "router-a")
+
+        async def cycling_hook(
+            model, request_kwargs, messages, input, specific_deployment
+        ):
+            return _make_pre_routing_response(
+                "router-b" if model == "router-a" else "router-a"
+            )
 
         mock_a = MagicMock()
         mock_a.async_pre_routing_hook = cycling_hook
@@ -396,7 +414,9 @@ class TestAsyncPreRoutingHookChaining:
 
         captured_messages = {}
 
-        async def capture_hook(model, request_kwargs, messages, input, specific_deployment):
+        async def capture_hook(
+            model, request_kwargs, messages, input, specific_deployment
+        ):
             captured_messages[model] = messages
             return _make_pre_routing_response(
                 "router-b" if model == "router-a" else "concrete",
@@ -412,7 +432,7 @@ class TestAsyncPreRoutingHookChaining:
             auto_routers={"router-a": mock_a},
             complexity_routers={"router-b": mock_b},
         )
-        result = await router.async_pre_routing_hook(
+        await router.async_pre_routing_hook(
             model="router-a",
             request_kwargs={},
             messages=messages,
@@ -495,8 +515,13 @@ class TestAsyncPreRoutingHookChaining:
 
     async def test_depth_boundary_max_depth_one(self):
         """max_depth=1 allows exactly one routing layer before the guard fires."""
-        async def cycling_hook(model, request_kwargs, messages, input, specific_deployment):
-            return _make_pre_routing_response("router-b" if model == "router-a" else "router-a")
+
+        async def cycling_hook(
+            model, request_kwargs, messages, input, specific_deployment
+        ):
+            return _make_pre_routing_response(
+                "router-b" if model == "router-a" else "router-a"
+            )
 
         mock_a = MagicMock()
         mock_a.async_pre_routing_hook = cycling_hook

@@ -2104,8 +2104,10 @@ class Router:
             # These are for internal observability only and must not leak
             # to backend APIs (OpenAI, Anthropic, etc. will reject them).
             _routing_keys = (
-                "_routing_chain", "_routing_layers",
-                "_total_routing_latency_ms", "max_router_chain_depth",
+                "_routing_chain",
+                "_routing_layers",
+                "_total_routing_latency_ms",
+                "max_router_chain_depth",
             )
             for _rk in _routing_keys:
                 kwargs.pop(_rk, None)

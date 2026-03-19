@@ -9,7 +9,7 @@ Anthropic, etc.) which reject unknown parameters with 400 errors.
 
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -52,7 +52,9 @@ async def test_routing_metadata_not_in_acompletion_call():
         mock_response.model = "gpt-4o-mini"
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "test"
-        mock_response.usage = MagicMock(prompt_tokens=5, completion_tokens=5, total_tokens=10)
+        mock_response.usage = MagicMock(
+            prompt_tokens=5, completion_tokens=5, total_tokens=10
+        )
         mock_response._hidden_params = {}
         return mock_response
 
@@ -62,7 +64,14 @@ async def test_routing_metadata_not_in_acompletion_call():
             model="test-model",
             messages=[{"role": "user", "content": "hello"}],
             _routing_chain=["auto", "code", "test-model"],
-            _routing_layers=[{"layer": 1, "router_type": "semantic", "route": "code", "latency_ms": 1.5}],
+            _routing_layers=[
+                {
+                    "layer": 1,
+                    "router_type": "semantic",
+                    "route": "code",
+                    "latency_ms": 1.5,
+                }
+            ],
             _total_routing_latency_ms=2.3,
             max_router_chain_depth=5,
         )
@@ -99,7 +108,9 @@ async def test_routing_metadata_stripped_from_litellm_params():
         mock_response.model = "gpt-4o-mini"
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "test"
-        mock_response.usage = MagicMock(prompt_tokens=5, completion_tokens=5, total_tokens=10)
+        mock_response.usage = MagicMock(
+            prompt_tokens=5, completion_tokens=5, total_tokens=10
+        )
         mock_response._hidden_params = {}
         return mock_response
 
@@ -109,6 +120,6 @@ async def test_routing_metadata_stripped_from_litellm_params():
             messages=[{"role": "user", "content": "hello"}],
         )
 
-    assert "max_router_chain_depth" not in captured_kwargs, (
-        "max_router_chain_depth from litellm_params leaked into outbound call"
-    )
+    assert (
+        "max_router_chain_depth" not in captured_kwargs
+    ), "max_router_chain_depth from litellm_params leaked into outbound call"
