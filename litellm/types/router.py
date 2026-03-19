@@ -213,6 +213,9 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
     complexity_router_config: Optional[Dict] = None
     complexity_router_default_model: Optional[str] = None
 
+    # chained router params
+    max_router_chain_depth: int = 5
+
     # Batch/File API Params
     s3_bucket_name: Optional[str] = None
     s3_encryption_key_id: Optional[str] = None
@@ -770,6 +773,15 @@ class ModelGroupSettings(BaseModel):
     forward_client_headers_to_llm_api: Optional[List[str]] = None
 
 
+class RoutingLayerInfo(BaseModel):
+    """Metadata about a single layer in a router chain."""
+
+    layer: int
+    router_type: str  # "semantic" or "complexity"
+    route: str  # resolved model name from this layer
+    latency_ms: float
+
+
 class PreRoutingHookResponse(BaseModel):
     """
     Response object from the pre-routing hook.
@@ -781,3 +793,6 @@ class PreRoutingHookResponse(BaseModel):
 
     model: str
     messages: Optional[List[Dict[str, Any]]]
+    # populated by chained resolution in async_pre_routing_hook
+    routing_chain: Optional[List[str]] = None
+    routing_layers: Optional[List[RoutingLayerInfo]] = None

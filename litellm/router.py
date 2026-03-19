@@ -302,6 +302,7 @@ class Router:
         ] = RouterGeneralSettings(),
         deployment_affinity_ttl_seconds: int = 3600,
         ignore_invalid_deployments: bool = False,
+        max_router_chain_depth: int = 5,
     ) -> None:
         """
         Initialize the Router class with the given parameters for caching, reliability, and routing strategy.
@@ -375,6 +376,7 @@ class Router:
 
         self.set_verbose = set_verbose
         self.ignore_invalid_deployments = ignore_invalid_deployments
+        self.max_router_chain_depth = max_router_chain_depth
         self.debug_level = debug_level
         self.enable_pre_call_checks = enable_pre_call_checks
         self.enable_tag_filtering = enable_tag_filtering
@@ -6793,6 +6795,9 @@ class Router:
         return False
 
     def set_model_list(self, model_list: list):
+        # Keep a pristine copy for startup validation (original_model_list is
+        # mutated by the .pop() calls in the loop below).
+        _model_list_for_validation = copy.deepcopy(model_list)
         original_model_list = copy.deepcopy(model_list)
         self.model_list = []
         self.model_id_to_deployment_index_map = {}  # Reset the index
@@ -6843,6 +6848,14 @@ class Router:
 
         # Note: model_name_to_deployment_indices is already built incrementally
         # by _create_deployment -> _add_model_to_list_and_index_map
+
+        # Validate that no circular router chains exist before requests start.
+        from litellm.router_utils.chain_validator import (
+            RouterChainConfigError,
+            detect_circular_chains,
+        )
+
+        detect_circular_chains(_model_list_for_validation)
 
     def _add_deployment(self, deployment: Deployment) -> Deployment:
         import os
@@ -9318,22 +9331,19 @@ class Router:
                     )
             raise e
 
-    async def async_pre_routing_hook(
+    def _is_virtual_router(self, model: str) -> bool:
+        """Return True if model is the name of a registered auto- or complexity-router."""
+        return model in self.auto_routers or model in self.complexity_routers
+
+    async def _invoke_single_router(
         self,
         model: str,
         request_kwargs: Dict,
-        messages: Optional[List[Dict[str, str]]] = None,
-        input: Optional[Union[str, List]] = None,
-        specific_deployment: Optional[bool] = False,
-    ) -> Optional[PreRoutingHookResponse]:
-        """
-        This hook is called before the routing decision is made.
-
-        Used for the litellm auto-router to modify the request before the routing decision is made.
-        """
-        #########################################################
-        # Check if any auto-router should be used
-        #########################################################
+        messages: Optional[List[Dict[str, str]]],
+        input: Optional[Union[str, List]],
+        specific_deployment: Optional[bool],
+    ) -> Optional["PreRoutingHookResponse"]:
+        """Invoke whichever single-layer router owns *model* and return its response."""
         if model in self.auto_routers:
             return await self.auto_routers[model].async_pre_routing_hook(
                 model=model,
@@ -9342,10 +9352,6 @@ class Router:
                 input=input,
                 specific_deployment=specific_deployment,
             )
-
-        #########################################################
-        # Check if any complexity-router should be used
-        #########################################################
         if model in self.complexity_routers:
             return await self.complexity_routers[model].async_pre_routing_hook(
                 model=model,
@@ -9354,8 +9360,109 @@ class Router:
                 input=input,
                 specific_deployment=specific_deployment,
             )
-
         return None
+
+    async def async_pre_routing_hook(
+        self,
+        model: str,
+        request_kwargs: Dict,
+        messages: Optional[List[Dict[str, str]]] = None,
+        input: Optional[Union[str, List]] = None,
+        specific_deployment: Optional[bool] = False,
+    ) -> Optional["PreRoutingHookResponse"]:
+        """
+        Called before the routing decision is made.
+
+        Supports chained resolution: if the resolved model is itself backed by
+        an auto- or complexity-router, we invoke that router too, continuing
+        until we reach a concrete deployment or exhaust max_router_chain_depth.
+
+        The full resolution path and per-layer timing are attached to the
+        returned PreRoutingHookResponse and written into request_kwargs so that
+        logging callbacks can surface them.
+        """
+        from litellm.types.router import PreRoutingHookResponse, RoutingLayerInfo
+
+        if not self._is_virtual_router(model):
+            return None
+
+        routing_chain: List[str] = [model]
+        routing_layers: List[RoutingLayerInfo] = []
+        current_model = model
+        current_messages = messages
+        layer_index = 0
+
+        while layer_index < self.max_router_chain_depth:
+            layer_start = time.perf_counter()
+            response = await self._invoke_single_router(
+                model=current_model,
+                request_kwargs=request_kwargs,
+                messages=current_messages,
+                input=input,
+                specific_deployment=specific_deployment,
+            )
+            latency_ms = (time.perf_counter() - layer_start) * 1000
+
+            if response is None:
+                break
+
+            # Determine router type for observability
+            if current_model in self.auto_routers:
+                router_type = "semantic"
+            else:
+                router_type = "complexity"
+
+            routing_layers.append(
+                RoutingLayerInfo(
+                    layer=layer_index + 1,
+                    router_type=router_type,
+                    route=response.model,
+                    latency_ms=round(latency_ms, 3),
+                )
+            )
+
+            resolved = response.model
+            routing_chain.append(resolved)
+
+            if current_messages is None and response.messages is not None:
+                current_messages = response.messages
+            elif response.messages is not None:
+                current_messages = response.messages
+
+            if not self._is_virtual_router(resolved):
+                # Reached a concrete deployment
+                break
+
+            current_model = resolved
+            layer_index += 1
+        else:
+            # Depth guard tripped — fall back to the model from the last
+            # successful layer and warn.
+            verbose_router_logger.warning(
+                f"Router chain depth limit ({self.max_router_chain_depth}) exceeded "
+                f"starting from '{model}'. Chain so far: {' → '.join(routing_chain)}. "
+                "Routing to last resolved model."
+            )
+
+        final_model = routing_chain[-1]
+        total_latency = sum(layer.latency_ms for layer in routing_layers)
+
+        result = PreRoutingHookResponse(
+            model=final_model,
+            messages=current_messages,
+            routing_chain=routing_chain,
+            routing_layers=routing_layers,
+        )
+
+        # Propagate chain metadata into request_kwargs for logging callbacks
+        if request_kwargs is not None:
+            request_kwargs["_routing_chain"] = routing_chain
+            request_kwargs["_routing_layers"] = [
+                layer.model_dump() for layer in routing_layers
+            ]
+            request_kwargs["_total_routing_latency_ms"] = round(total_latency, 3)
+
+        return result
 
     def get_available_deployment(
         self,
