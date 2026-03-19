@@ -2096,6 +2096,17 @@ class Router:
             )
             self.total_calls[model_name] += 1
 
+            # Strip routing chain metadata before building the outbound call.
+            # These are for internal observability only and must not leak
+            # to backend APIs (OpenAI, Anthropic, etc. will reject them).
+            _routing_keys = (
+                "_routing_chain", "_routing_layers",
+                "_total_routing_latency_ms", "max_router_chain_depth",
+            )
+            for _rk in _routing_keys:
+                kwargs.pop(_rk, None)
+                litellm_params.pop(_rk, None)
+
             input_kwargs = {
                 **litellm_params,
                 "messages": messages,
@@ -2104,6 +2115,8 @@ class Router:
                 **kwargs,
             }
             input_kwargs.pop("silent_model", None)
+            for _rk in _routing_keys:
+                input_kwargs.pop(_rk, None)
 
             _response = litellm.acompletion(**input_kwargs)
 
