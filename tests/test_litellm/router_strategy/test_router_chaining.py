@@ -385,10 +385,10 @@ class TestAsyncPreRoutingHookChaining:
         assert len(result.routing_layers) == 3
         assert result.model == "router-b"  # last resolved entry
         assert result.model == result.routing_chain[-1]
-        # Warning was emitted
-        mock_log.warning.assert_called_once()
-        warning_msg = mock_log.warning.call_args[0][0]
-        assert "depth limit" in warning_msg.lower() or "chain depth" in warning_msg.lower()
+        # Warnings were emitted: depth limit + virtual router fallback
+        assert mock_log.warning.call_count >= 1
+        warning_msgs = [call[0][0].lower() for call in mock_log.warning.call_args_list]
+        assert any("depth limit" in m or "chain depth" in m for m in warning_msgs)
 
     async def test_messages_propagated_through_chain(self):
         """Original messages are passed through all layers unchanged."""

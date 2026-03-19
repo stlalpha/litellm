@@ -9461,19 +9461,22 @@ class Router:
         # If the depth guard left us on a virtual router, walk the chain
         # backwards to find the last concrete (non-virtual) model.
         if self._is_virtual_router(final_model):
-            concrete_model = None
             for candidate in reversed(routing_chain):
                 if not self._is_virtual_router(candidate):
-                    concrete_model = candidate
+                    verbose_router_logger.warning(
+                        f"Chain final model '{final_model}' is a virtual router. "
+                        f"Falling back to last concrete model: '{candidate}'."
+                    )
+                    final_model = candidate
                     break
-            if concrete_model is None:
-                raise ValueError(
-                    f"Router chain for '{model}' resolved only to virtual routers "
-                    f"after hitting the depth limit ({self.max_router_chain_depth}). "
-                    f"Chain: {' → '.join(routing_chain)}. "
-                    "No concrete deployment found to route to."
+            else:
+                # Every entry in the chain is a virtual router. Log a warning
+                # but let it through - normal deployment selection will handle
+                # the error with a proper "no healthy deployments" message.
+                verbose_router_logger.warning(
+                    f"Router chain for '{model}' resolved only to virtual routers. "
+                    f"Chain: {' → '.join(routing_chain)}."
                 )
-            final_model = concrete_model
 
         total_latency = sum(layer.latency_ms for layer in routing_layers)
 
