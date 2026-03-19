@@ -122,6 +122,7 @@ from litellm.router_utils.pre_call_checks.model_rate_limit_check import (
 from litellm.router_utils.pre_call_checks.prompt_caching_deployment_check import (
     PromptCachingDeploymentCheck,
 )
+from litellm.router_utils.chain_validator import detect_circular_chains
 from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     increment_deployment_failures_for_current_minute,
     increment_deployment_successes_for_current_minute,
@@ -6850,11 +6851,6 @@ class Router:
         # by _create_deployment -> _add_model_to_list_and_index_map
 
         # Validate that no circular router chains exist before requests start.
-        from litellm.router_utils.chain_validator import (
-            RouterChainConfigError,
-            detect_circular_chains,
-        )
-
         detect_circular_chains(_model_list_for_validation)
 
     def _add_deployment(self, deployment: Deployment) -> Deployment:

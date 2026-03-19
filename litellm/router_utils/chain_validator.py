@@ -4,54 +4,11 @@ Startup validation for chained router configurations.
 Detects circular references in router chains before they cause infinite loops
 at request time.
 """
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 
 class RouterChainConfigError(ValueError):
     """Raised when a circular router chain is detected during startup validation."""
-
-
-def _get_auto_router_targets(model_list: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
-    """
-    Build a mapping of virtual model_name -> its resolved target model.
-
-    For auto-router (semantic) deployments the target is the default_model
-    stored in litellm_params (auto_router_default_model). Individual routes
-    may resolve to any model name at runtime, but the full set of route names
-    is what we really want to validate.  We do a best-effort check: if any
-    route target itself is a chained router we'll catch the default path at
-    minimum; full route-level validation would require loading the route JSON
-    at startup, which is expensive and error-prone.
-
-    For complexity-router deployments the targets are the tier model names
-    stored in complexity_router_config.tiers.
-    """
-    targets: Dict[str, Optional[str]] = {}
-
-    for entry in model_list:
-        model_name: str = entry.get("model_name", "")
-        litellm_params: Dict = entry.get("litellm_params", {})
-        model: str = litellm_params.get("model", "")
-
-        if model.startswith("auto_router/complexity_router"):
-            config: Dict = litellm_params.get("complexity_router_config") or {}
-            tiers: Dict[str, str] = config.get("tiers", {})
-            # Record each tier target for this virtual model
-            for tier_model in tiers.values():
-                if tier_model:
-                    # key is the virtual name, values are all tier targets
-                    targets.setdefault(model_name, tier_model)
-            # Also stash a mapping entry for each tier model so we can walk from
-            # this virtual node to each possible resolution.
-            if model_name not in targets:
-                default = litellm_params.get("complexity_router_default_model")
-                targets[model_name] = default
-
-        elif model.startswith("auto_router/"):
-            default = litellm_params.get("auto_router_default_model")
-            targets[model_name] = default
-
-    return targets
 
 
 def _build_full_graph(model_list: List[Dict[str, Any]]) -> Dict[str, List[str]]:
@@ -66,21 +23,26 @@ def _build_full_graph(model_list: List[Dict[str, Any]]) -> Dict[str, List[str]]:
     graph: Dict[str, List[str]] = {}
 
     for entry in model_list:
-        model_name: str = entry.get("model_name", "")
-        litellm_params: Dict = entry.get("litellm_params", {})
-        model: str = litellm_params.get("model", "")
+        model_name: str = entry.get("model_name") or ""
+        litellm_params: Dict[str, Any] = entry.get("litellm_params") or {}
+        model: str = litellm_params.get("model") or ""
+
+        if not model_name:
+            continue
 
         if model.startswith("auto_router/complexity_router"):
-            config: Dict = litellm_params.get("complexity_router_config") or {}
-            tiers: Dict[str, str] = config.get("tiers", {})
-            default = litellm_params.get("complexity_router_default_model")
-            edges = [t for t in tiers.values() if t]
+            config: Dict[str, Any] = (
+                litellm_params.get("complexity_router_config") or {}
+            )
+            tiers: Dict[str, str] = config.get("tiers") or {}
+            default: str = litellm_params.get("complexity_router_default_model") or ""
+            edges: List[str] = [t for t in tiers.values() if t]
             if default and default not in edges:
                 edges.append(default)
             graph[model_name] = edges
 
         elif model.startswith("auto_router/"):
-            default = litellm_params.get("auto_router_default_model")
+            default = litellm_params.get("auto_router_default_model") or ""
             graph[model_name] = [default] if default else []
 
     return graph
@@ -98,8 +60,6 @@ def detect_circular_chains(model_list: List[Dict[str, Any]]) -> None:
             of the cycle path.
     """
     graph = _build_full_graph(model_list)
-    # Only virtual router nodes can be part of a cycle; concrete deployments
-    # are leaf nodes with no outgoing edges.
     virtual_nodes: Set[str] = set(graph.keys())
 
     visited: Set[str] = set()
@@ -109,7 +69,6 @@ def detect_circular_chains(model_list: List[Dict[str, Any]]) -> None:
         if node not in virtual_nodes:
             return  # concrete deployment, no outgoing edges
         if node in in_stack:
-            # Found a cycle — reconstruct the cycle segment
             cycle_start = path.index(node)
             cycle_path = path[cycle_start:] + [node]
             raise RouterChainConfigError(
