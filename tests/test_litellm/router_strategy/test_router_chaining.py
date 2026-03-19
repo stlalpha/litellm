@@ -358,15 +358,7 @@ class TestAsyncPreRoutingHookChaining:
     async def test_max_depth_guard_stops_chain(self):
         """When max_depth is exceeded the hook returns the last resolved model
         and logs a warning, without raising an exception."""
-        # Build a chain that would go: a → b → a → b → ... (infinite if not guarded)
-        # We mock _is_virtual_router to always return True for b so the loop
-        # keeps trying, then depth guard fires.
-
-        call_count = {"n": 0}
-
         async def cycling_hook(model, request_kwargs, messages, input, specific_deployment):
-            call_count["n"] += 1
-            # Always resolve to the other router to simulate an infinite cycle
             return _make_pre_routing_response("router-b" if model == "router-a" else "router-a")
 
         mock_a = MagicMock()
@@ -387,7 +379,11 @@ class TestAsyncPreRoutingHookChaining:
             )
 
         assert result is not None
-        # Depth guard fires — last entry in the chain is the final resolved model
+        # With max_depth=3 the loop runs 3 times: a→b, b→a, a→b, then the
+        # while-else fires. Chain: [router-a, router-b, router-a, router-b].
+        assert result.routing_chain == ["router-a", "router-b", "router-a", "router-b"]
+        assert len(result.routing_layers) == 3
+        assert result.model == "router-b"  # last resolved entry
         assert result.model == result.routing_chain[-1]
         # Warning was emitted
         mock_log.warning.assert_called_once()
@@ -445,8 +441,86 @@ class TestAsyncPreRoutingHookChaining:
         # Existing keys must not be removed
         assert request_kwargs["some_existing_key"] == "value"
 
+    async def test_routing_layers_dict_structure_in_request_kwargs(self):
+        """_routing_layers in request_kwargs must be a list of dicts with the
+        expected keys from RoutingLayerInfo.model_dump()."""
+        mock_router = AsyncMock()
+        mock_router.async_pre_routing_hook = AsyncMock(
+            return_value=_make_pre_routing_response("gpt-4o")
+        )
+
+        request_kwargs: Dict[str, Any] = {}
+        router = _make_router_with_hooks(complexity_routers={"cr": mock_router})
+        await router.async_pre_routing_hook(
+            model="cr",
+            request_kwargs=request_kwargs,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        layers = request_kwargs["_routing_layers"]
+        assert isinstance(layers, list)
+        assert len(layers) == 1
+        layer = layers[0]
+        assert layer["layer"] == 1
+        assert layer["router_type"] == "complexity"
+        assert layer["route"] == "gpt-4o"
+        assert isinstance(layer["latency_ms"], float)
+        assert layer["latency_ms"] >= 0
+
+    async def test_total_latency_equals_sum_of_layer_latencies(self):
+        """_total_routing_latency_ms must equal sum of individual layer latencies."""
+        semantic_mock = AsyncMock()
+        semantic_mock.async_pre_routing_hook = AsyncMock(
+            return_value=_make_pre_routing_response("cr")
+        )
+        complexity_mock = AsyncMock()
+        complexity_mock.async_pre_routing_hook = AsyncMock(
+            return_value=_make_pre_routing_response("gpt-4o")
+        )
+
+        router = _make_router_with_hooks(
+            auto_routers={"sem": semantic_mock},
+            complexity_routers={"cr": complexity_mock},
+        )
+        request_kwargs: Dict[str, Any] = {}
+        await router.async_pre_routing_hook(
+            model="sem",
+            request_kwargs=request_kwargs,
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+        layers = request_kwargs["_routing_layers"]
+        expected_total = round(sum(layer["latency_ms"] for layer in layers), 3)
+        assert request_kwargs["_total_routing_latency_ms"] == expected_total
+
+    async def test_depth_boundary_max_depth_one(self):
+        """max_depth=1 allows exactly one routing layer before the guard fires."""
+        async def cycling_hook(model, request_kwargs, messages, input, specific_deployment):
+            return _make_pre_routing_response("router-b" if model == "router-a" else "router-a")
+
+        mock_a = MagicMock()
+        mock_a.async_pre_routing_hook = cycling_hook
+        mock_b = MagicMock()
+        mock_b.async_pre_routing_hook = cycling_hook
+
+        router = _make_router_with_hooks(
+            auto_routers={"router-a": mock_a, "router-b": mock_b},
+            max_depth=1,
+        )
+        with patch("litellm.router.verbose_router_logger"):
+            result = await router.async_pre_routing_hook(
+                model="router-a",
+                request_kwargs={},
+                messages=[{"role": "user", "content": "x"}],
+            )
+
+        # One iteration: router-a → router-b. Depth guard fires immediately after.
+        assert result.routing_chain == ["router-a", "router-b"]
+        assert len(result.routing_layers) == 1
+
     async def test_single_router_returns_none_falls_through(self):
-        """If the first (and only) router returns None, the hook returns None."""
+        """If a router layer returns None (e.g. no messages to classify), the
+        hook breaks out of the chain and returns the entry model unchanged."""
         mock_router = AsyncMock()
         mock_router.async_pre_routing_hook = AsyncMock(return_value=None)
 
@@ -456,50 +530,85 @@ class TestAsyncPreRoutingHookChaining:
             request_kwargs={},
             messages=None,
         )
-        # When the first layer returns None we break out of the loop immediately
-        # and routing_chain contains only the initial model — this is an edge
-        # case (no messages), handled gracefully without error.
+        # Loop breaks immediately; routing_chain has only the initial model.
         assert result is not None
         assert result.model == "cr"
+        assert result.routing_chain == ["cr"]
+        assert result.routing_layers == []
 
 
 # ---------------------------------------------------------------------------
-# Router.set_model_list startup validation integration
+# Router.set_model_list startup validation — real Router constructor
 # ---------------------------------------------------------------------------
 
 
 class TestSetModelListCircularValidation:
-    """Verify that the Router constructor rejects circular chains at startup."""
+    """Verify the Router constructor rejects circular chains via set_model_list."""
 
-    def test_valid_chain_initializes_ok(self):
-        """Two-layer chain with concrete tier targets should initialize."""
-        # We use minimal fake models that pass provider validation.
-        # Because we don't want to require API keys in unit tests, we patch
-        # litellm.get_llm_provider and the auto/complexity router init.
-        from unittest.mock import patch
+    def test_valid_complexity_chain_router_init_ok(self):
+        """Router with two chained complexity routers (no concrete models needed
+        for the cycle check) initialises without error when no cycle exists."""
+        from litellm import Router
 
+        # Two complexity routers where A's tier targets B and B's tier targets
+        # a concrete model name — valid DAG, no cycle.
         model_list = [
             {
-                "model_name": "cheap",
-                "litellm_params": {"model": "openai/gpt-4o-mini"},
-            },
-            {
-                "model_name": "cr",
+                "model_name": "cr-inner",
                 "litellm_params": {
                     "model": "auto_router/complexity_router",
-                    "complexity_router_config": {"tiers": {"SIMPLE": "cheap"}},
-                    "complexity_router_default_model": "cheap",
+                    "complexity_router_config": {
+                        "tiers": {"SIMPLE": "gpt-4o-mini", "MEDIUM": "gpt-4o"},
+                    },
+                    "complexity_router_default_model": "gpt-4o-mini",
+                },
+            },
+            {
+                "model_name": "cr-outer",
+                "litellm_params": {
+                    "model": "auto_router/complexity_router",
+                    "complexity_router_config": {
+                        "tiers": {"SIMPLE": "cr-inner", "MEDIUM": "gpt-4o"},
+                    },
+                    "complexity_router_default_model": "cr-inner",
                 },
             },
         ]
-        # detect_circular_chains runs inside set_model_list; a clean config
-        # must not raise RouterChainConfigError.
-        from litellm.router_utils.chain_validator import detect_circular_chains
+        # Should not raise
+        router = Router(model_list=model_list)
+        assert "cr-inner" in router.complexity_routers
+        assert "cr-outer" in router.complexity_routers
 
-        detect_circular_chains(model_list)  # no exception
+    def test_circular_chain_raises_at_router_init(self):
+        """Router.__init__ must raise RouterChainConfigError when a cycle is
+        present in the model_list, via the set_model_list wiring."""
+        from litellm import Router
 
-    def test_circular_chain_raises_config_error(self):
-        """Router.set_model_list must raise RouterChainConfigError for cycles."""
+        model_list = [
+            {
+                "model_name": "cr-a",
+                "litellm_params": {
+                    "model": "auto_router/complexity_router",
+                    "complexity_router_config": {"tiers": {"SIMPLE": "cr-b"}},
+                    "complexity_router_default_model": "cr-b",
+                },
+            },
+            {
+                "model_name": "cr-b",
+                "litellm_params": {
+                    "model": "auto_router/complexity_router",
+                    "complexity_router_config": {"tiers": {"SIMPLE": "cr-a"}},
+                    "complexity_router_default_model": "cr-a",
+                },
+            },
+        ]
+        with pytest.raises(RouterChainConfigError, match="Circular router chain"):
+            Router(model_list=model_list)
+
+    def test_self_loop_raises_at_router_init(self):
+        """A single complexity router whose tier points to itself raises at init."""
+        from litellm import Router
+
         model_list = [
             {
                 "model_name": "loop",
@@ -511,6 +620,4 @@ class TestSetModelListCircularValidation:
             },
         ]
         with pytest.raises(RouterChainConfigError, match="Circular router chain"):
-            from litellm.router_utils.chain_validator import detect_circular_chains
-
-            detect_circular_chains(model_list)
+            Router(model_list=model_list)
