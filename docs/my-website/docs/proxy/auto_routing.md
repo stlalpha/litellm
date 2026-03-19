@@ -405,3 +405,150 @@ The router scores each request across 7 dimensions:
 
 **Special behavior:** If 2+ reasoning markers are detected in the user message, the request automatically routes to the REASONING tier regardless of the weighted score.
 
+## Chained Routing (Semantic + Complexity)
+
+Semantic routing and complexity routing solve different problems. Semantic routing classifies what kind of work a request is (coding, admin, research). Complexity routing classifies how hard that work is (simple, medium, complex, reasoning). Using them together requires chaining: the semantic router resolves an intent, and the complexity router within that intent picks the tier.
+
+The proxy handles this automatically. If a semantic router's route name matches a complexity router deployment, the proxy invokes the complexity router as a second layer. The chain continues until it reaches a concrete model or hits `max_router_chain_depth` (default 5).
+
+### Configuration
+
+The semantic route names in `router.json` must match complexity router `model_name` entries in `config.yaml`.
+
+**router.json:**
+
+```json
+{
+  "encoder_type": "litellm",
+  "encoder_name": "openai/text-embedding-3-small",
+  "routes": [
+    {
+      "name": "code",
+      "utterances": [
+        "write a function that",
+        "debug this code",
+        "explain this JCL job"
+      ],
+      "score_threshold": 0.40
+    },
+    {
+      "name": "admin",
+      "utterances": [
+        "draft an email to the client",
+        "write a status update"
+      ],
+      "score_threshold": 0.40
+    }
+  ]
+}
+```
+
+**config.yaml:**
+
+```yaml
+model_list:
+  # Concrete models
+  - model_name: local-coder
+    litellm_params:
+      model: ollama/qwen2.5-coder:7b
+      api_base: http://localhost:11434
+
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: gpt-4o-mini
+
+  - model_name: sonnet
+    litellm_params:
+      model: claude-sonnet-4-20250514
+
+  - model_name: opus
+    litellm_params:
+      model: claude-opus-4-20250514
+
+  # Embedding model for semantic routing
+  - model_name: openai/text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+
+  # Layer 2: complexity routers (one per intent)
+  - model_name: code
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers:
+          SIMPLE: local-coder
+          MEDIUM: sonnet
+          COMPLEX: opus
+      complexity_router_default_model: sonnet
+
+  - model_name: admin
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers:
+          SIMPLE: gpt-4o-mini
+          MEDIUM: gpt-4o
+          COMPLEX: opus
+      complexity_router_default_model: gpt-4o
+
+  # Layer 1: semantic router (entry point)
+  - model_name: auto
+    litellm_params:
+      model: auto_router/semantic_router
+      auto_router_config_path: router.json
+      auto_router_default_model: admin
+      auto_router_embedding_model: openai/text-embedding-3-small
+```
+
+Clients send `model: "auto"`. The proxy resolves `auto` -> semantic classification -> `code` or `admin` -> complexity scoring -> concrete model.
+
+### Custom Keywords
+
+Each complexity router can override the default keyword lists to match domain-specific content. Keywords are matched using word boundaries for single words and substring matching for phrases.
+
+```yaml
+  - model_name: code
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers:
+          SIMPLE: local-coder
+          MEDIUM: sonnet
+          COMPLEX: opus
+        code_keywords:
+          - function
+          - debug
+          - cobol
+          - cics
+          - vsam
+          - db2
+          - jcl
+          - rpg
+        technical_keywords:
+          - referential integrity
+          - transaction
+          - deadlock
+          - sysplex
+      complexity_router_default_model: sonnet
+```
+
+### Chain Depth
+
+The `max_router_chain_depth` parameter (default 5) limits how many router layers the proxy will walk. Set it on the Router constructor:
+
+```python
+router = Router(model_list=model_list, max_router_chain_depth=3)
+```
+
+Circular chains (A -> B -> A) are detected at startup and rejected with `RouterChainConfigError`.
+
+### Observability
+
+After chained resolution, the proxy writes metadata into request kwargs for logging callbacks:
+
+- `_routing_chain`: list of model names in the resolution path, e.g. `["auto", "code", "sonnet"]`
+- `_routing_layers`: list of dicts with `layer`, `router_type` ("semantic" or "complexity"), `route`, and `latency_ms`
+- `_total_routing_latency_ms`: sum of all layer latencies
+
+This metadata is stripped before the outbound API call and is only visible to logging callbacks.
+
